@@ -18,6 +18,7 @@ from sdp.logging import logger
 from sdp.processors.datasets.commoncrawl.harv_utils import ffmpeg_convert, txt2vtt, make_trans_list, get_vtt_text, text2lid, load_manifest, read_jsonl, write_jsonl, split_by_vtt_new, audio_duration
 from scipy.spatial import distance
 
+
 class JoinBy(BaseProcessor):
     """
     This processor join several lines into one
@@ -61,7 +62,11 @@ class AudioDuration(BaseParallelProcessor):
     
     def process_dataset_entry(self, data_entry):
         audio_filepath = data_entry[self.input_field]
-        data_entry[self.output_field]=audio_duration(audio_filepath)
+        try:
+            data_entry[self.output_field]=audio_duration(audio_filepath)
+        except Exception as e:
+            logger.warning(str(e) + " file: " + audio_filepath)
+            data_entry[self.output_field] = -1.0
         return [DataEntry(data=data_entry)]
 
 class EvalBandwidth(BaseParallelProcessor):
@@ -729,6 +734,7 @@ class TextLid(BaseProcessor):
         pretrained_model: str,
         output_lang_field: str,
         device: str,
+        drop_text_duplicates: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -736,6 +742,7 @@ class TextLid(BaseProcessor):
         self.pretrained_model = pretrained_model
         self.output_lang_field = output_lang_field
         self.device = device
+        self.drop_duplicates = drop_text_duplicates
     
     def process(self):
         import torch  # importing after nemo to make sure users first install nemo, instead of torch, then nemo
@@ -755,18 +762,20 @@ class TextLid(BaseProcessor):
         manifest = load_manifest(Path(self.input_manifest_file))
 
         Path(self.output_manifest_file).parent.mkdir(exist_ok=True, parents=True)
-
+        text_set = set()
         with Path(self.output_manifest_file).open('w') as f:
             for item in tqdm(manifest):
                 text = item[self.input_text_field]
-                if text:
-                    lid = text2lid(text_model, tokenizer, text)
-                else:
-                    lid = None
-            
-                if lid:
-                    item[self.output_lang_field] = lid
-                    f.write(json.dumps(item, ensure_ascii=False) + '\n')
+                if self.drop_duplicates and text not in text_set:
+                    text_set.add(text)
+                    if text:
+                        lid = text2lid(text_model, tokenizer, text)
+                    else:
+                        lid = None
+                
+                    if lid:
+                        item[self.output_lang_field] = lid
+                        f.write(json.dumps(item, ensure_ascii=False) + '\n')
 
 class AllVttText(BaseParallelProcessor):
     """
@@ -843,14 +852,14 @@ class ReadParquet(BaseParallelProcessor):
     def __init__(
         self,
         output_video_field: str,
-        output_vtt_field: str,
+        output_caption_field: str,
         key_field: str,
         raw_data_dir: str,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.output_video_field = output_video_field
-        self.output_vtt_field = output_vtt_field
+        self.output_caption_field = output_caption_field
         self.key_field = key_field
         self.raw_data_dir = Path(raw_data_dir)
 
@@ -872,12 +881,16 @@ class ReadParquet(BaseParallelProcessor):
         key = key.split("/")[1]
         try:
             data_entry[self.output_video_field] = self.urls.loc[key]['url']
-            data_entry[self.output_vtt_field] = self.urls.loc[key]['caption']
+            data_entry[self.output_caption_field] = self.urls.loc[key]['caption']
         except:
             data_entry[self.output_video_field] = "NN"
-            data_entry[self.output_vtt_field] = "NN"
+            data_entry[self.output_caption_field] = "NN"
             logger.warning("Key without URL or caption: " + key)
         return [DataEntry(data=data_entry)]
+
+def get_key(x):
+    key = "/".join(os.path.splitext(x)[0].split("/")[-2:])
+    return key
 
 class CreateInitialManifestCC(BaseParallelProcessor):
     """
@@ -890,36 +903,29 @@ class CreateInitialManifestCC(BaseParallelProcessor):
     def __init__(
         self,
         raw_data_dir: str,
-        resampled_audio_dir: str,
-        audio_field: str,
         video_field: str,
         key_field: str,
         text_field: str,
-        target_samplerate: int = 16000,
-        target_nchannels: int = 1,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.raw_data_dir = Path(raw_data_dir)
-        self.audio_field = audio_field
         self.video_field = video_field
         self.key_field = key_field
         self.text_field = text_field
-        self.resampled_audio_dir = resampled_audio_dir
-        self.target_samplerate = target_samplerate
-        self.target_nchannels = target_nchannels
 
     def prepare(self):
         os.makedirs(self.raw_data_dir, exist_ok=True)
-        os.makedirs(self.resampled_audio_dir, exist_ok=True)
 
+    
     def read_manifest(self):
         videos = [str(self.raw_data_dir / video) for video in self.raw_data_dir.rglob('*.jpg')]
         texts = [str(self.raw_data_dir / text) for text in self.raw_data_dir.rglob('*.txt')]
         v_df = pd.DataFrame({self.video_field: videos})
         t_df = pd.DataFrame({self.text_field: texts })
-        v_df[self.key_field] = v_df[self.video_field].apply(lambda x: os.path.splitext(x)[0][-13:])
-        t_df[self.key_field] = t_df[self.text_field].apply(lambda x: os.path.splitext(x)[0][-13:])
+
+        v_df[self.key_field] = v_df[self.video_field].apply(get_key)
+        t_df[self.key_field] = t_df[self.text_field].apply(get_key)
         v_df = v_df.drop_duplicates(self.key_field)
         t_df = t_df.drop_duplicates(self.key_field)
         vt_df = v_df.merge(t_df, on=self.key_field, how="left")
@@ -927,13 +933,8 @@ class CreateInitialManifestCC(BaseParallelProcessor):
 
     def process_dataset_entry(self, data_entry):
         (video,	key, text) = data_entry
-        os.makedirs(os.path.join(self.resampled_audio_dir, key.split("/")[0]), exist_ok=True)
-        audio = os.path.join(self.resampled_audio_dir, key) + ".wav"
-        if not os.path.isfile(audio):
-            ffmpeg_convert(video, audio, self.target_samplerate, self.target_nchannels)
 
-        data = {self.audio_field: audio,
-                self.video_field: video,
+        data = {self.video_field: video,
                 self.key_field: key,
                 self.text_field: text}
         return [DataEntry(data=data)]
@@ -960,23 +961,23 @@ class FfmpegConvert(BaseParallelProcessor):
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.audio_field = input_field
-        self.video_field = output_field
+        self.input_field = input_field
+        self.output_field = output_field
         self.key_field = key_field
         self.resampled_audio_dir = resampled_audio_dir
         self.target_samplerate = target_samplerate
         self.target_nchannels = target_nchannels
 
     def process_dataset_entry(self, data_entry):
-        video = data_entry[self.video_field]
-        key = os.path.splitext(data_entry[self.video_field])[0][-13:]
+        video = data_entry[self.input_field]
+        key = data_entry[self.key_field]
         os.makedirs(os.path.join(self.resampled_audio_dir, key.split("/")[0]), exist_ok=True)
         audio = os.path.join(self.resampled_audio_dir, key) + ".wav"
 
         if not os.path.isfile(audio):
             ffmpeg_convert(video, audio, self.target_samplerate, self.target_nchannels)
 
-        data_entry[self.audio_field]= audio
+        data_entry[self.output_field]= audio
         data_entry[self.key_field] = key
         return [DataEntry(data=data_entry)]
 
