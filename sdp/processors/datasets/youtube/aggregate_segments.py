@@ -14,7 +14,18 @@ import os
 
 from sdp.processors.base_processor import BaseParallelProcessor
 from sdp.processors.datasets.youtube.utils import RawSegment, AggregatedSegment, get_audio_segment
+import logging
 
+
+logging.basicConfig(level=logging.DEBUG,  
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',  
+                    handlers=[
+                        logging.FileHandler("application.log"),  
+                        logging.StreamHandler()  
+                    ])
+
+
+logger = logging.getLogger(__name__)
 
 class AggregateSegments(BaseParallelProcessor):
     def __init__(
@@ -36,36 +47,40 @@ class AggregateSegments(BaseParallelProcessor):
     def process_dataset_entry(self, data_entry: dict):
         sample_id = data_entry['sample_id']
         segments = data_entry['segments']
+
+        # Check if segments != Null
+        if not segments:
+            logger.warning(f"No segments found for sample_id {sample_id}. Skipping.")
+            return [] #exit
+
         agg_segments = []
 
-        if len(segments) == 0:
-            return agg_segments
-
+        
         first_segment = RawSegment(**segments[0])
         agg_segment = AggregatedSegment(segment=first_segment, segment_id=1, sample_id=sample_id, 
-                                        output_audio_dir = self.output_segments_audio_dir)
+                                        output_audio_dir=self.output_segments_audio_dir)
 
-        for segment in segments[1 : ]:
+        for segment in segments[1:]:
             segment = RawSegment(**segment)
-            
+
             if (not agg_segment.duration_match or 
                 agg_segment.duration >= self.max_duration or
                 segment.end_time - agg_segment.start_time >= self.max_duration):
                 agg_segments.append(agg_segment.to_dataentry())
                 agg_segment = AggregatedSegment(segment=segment, 
                                                 segment_id=len(agg_segments) + 1, sample_id=sample_id, 
-                                                output_audio_dir = self.output_segments_audio_dir)
+                                                output_audio_dir=self.output_segments_audio_dir)
             else:
                 agg_segment.aggregate(segment)
         else:
             agg_segments.append(agg_segment.to_dataentry())
-        
+
         if self.crop_audio_segments:
             audio = AudioSegment.from_wav(data_entry['audio_filepath'])
             for agg_segment in agg_segments:
-                get_audio_segment(audio = audio, 
-                                  start_time = agg_segment.data['start_time'], 
-                                  end_time = agg_segment.data['end_time'], 
-                                  output_audio_filepath = agg_segment.data['audio_filepath'])
-        
+                get_audio_segment(audio=audio, 
+                                start_time=agg_segment.data['start_time'], 
+                                end_time=agg_segment.data['end_time'], 
+                                output_audio_filepath=agg_segment.data['audio_filepath'])
+
         return agg_segments
